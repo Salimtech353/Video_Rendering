@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   render:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       JOB: ${{ inputs.job }}
@@ -23,7 +23,7 @@ jobs:
         run: |
           [[ "$JOB" =~ ^[A-Za-z0-9_-]{4,64}$ ]] || { echo "bad job id"; exit 1; }
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install FFmpeg and fonts
         run: |
