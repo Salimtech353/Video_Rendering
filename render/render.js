@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Reels Factory — GitHub Actions ভিডিও রেন্ডারার (FFmpeg)
+// Reels Factory — GitHub Actions ভিডিও রেন্ডারার (FFmpeg) — ভার্সন ২
 // ব্যবহার: node render/render.js jobs/<jobId> out/video.mp4
 // জবের ফোল্ডারে job.json থাকে (ওয়েব অ্যাপ বানায়) + আপলোড/AI ছবি + অডিও।
 "use strict";
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { spawnSync, spawn } = require("child_process");
 
 const [jobArg, outArg] = process.argv.slice(2);
 if (!jobArg || !outArg) {
@@ -21,6 +21,7 @@ const FPS = 30;
 const { W, H, cw, ch } = job;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const toFrames = (sec) => Math.round(sec * FPS);
 
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, { stdio: ["ignore", "inherit", "inherit"], ...opts });
@@ -31,6 +32,26 @@ function capture(cmd, args) {
   return r.status === 0 ? r.stdout.trim() : "";
 }
 const ff = (args, opts) => run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "warning", ...args], opts);
+
+// ---------- অ্যাপকে প্রগ্রেস জানানো (jobs/<id>/progress.json — ব্যর্থ হলেও রেন্ডার থামে না) ----------
+let lastReport = 0;
+let progSha = null;
+function report(stage, i, n, pct, force = false) {
+  if (!process.env.GITHUB_ACTIONS || !process.env.GH_TOKEN || !process.env.GITHUB_REPOSITORY) return;
+  const now = Date.now();
+  if (!force && now - lastReport < 8000) return;
+  lastReport = now;
+  const body = Buffer.from(JSON.stringify({ stage, i, n, pct: Math.round(pct) })).toString("base64");
+  const rel = `jobs/${path.basename(jobDir)}/progress.json`;
+  const args = ["api", "-X", "PUT", `repos/${process.env.GITHUB_REPOSITORY}/contents/${rel}`, "-f", "message=progress", "-f", `content=${body}`, "-f", "branch=main"];
+  if (progSha) args.push("-f", `sha=${progSha}`);
+  const r = spawnSync("gh", args, { encoding: "utf8" });
+  if (r.status === 0) {
+    try {
+      progSha = JSON.parse(r.stdout).content.sha;
+    } catch (_) {}
+  }
+}
 
 async function download(url, dest) {
   let lastErr;
@@ -76,31 +97,77 @@ function probeDuration(file) {
 }
 
 const ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-r", String(FPS), "-an"];
+const borderHex = "0x" + String(job.borderColor || "#1A1A1A").replace("#", "");
 
-async function buildScene(seg, i) {
-  const outp = path.join(work, `scene${i}.mp4`);
-  const d = Math.max(0.1, seg.duration);
-  const src = await resolveMedia(seg.media, `m${i}`);
-  if (seg.media.type === "photo") {
-    const frames = Math.max(1, Math.round(d * FPS));
-    const vf =
-      `scale=${cw * 2}:${ch * 2}:force_original_aspect_ratio=increase,crop=${cw * 2}:${ch * 2},` +
-      `zoompan=z='1+0.15*on/${frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${cw}x${ch}:fps=${FPS},setsar=1`;
-    ff(["-i", src, "-vf", vf, "-frames:v", String(frames), ...ENC, outp]);
+// অ্যাপের ট্রানজিশন নাম -> FFmpeg xfade নাম
+const XFADE = {
+  fade: "fade",
+  slideLeft: "slideleft",
+  slideRight: "slideright",
+  slideUp: "slideup",
+  zoom: "zoomin",
+  carouselLeft: "smoothleft",
+  carouselRight: "smoothright",
+  wipeLeft: "wipeleft",
+  wipeRight: "wiperight",
+};
+const transitionList = (job.transitions && job.transitions.length ? job.transitions : Object.keys(XFADE)).map((n) => XFADE[n] || "fade");
+
+// ---------- একটা আইটেম (দৃশ্য/ফাঁক) রেন্ডার: head | body | tail টুকরো ----------
+// head/tail হলো ট্রানজিশনে মেশার অংশ (tp/tn ফ্রেম); এতে দৃশ্যের সময় ঠিক থাকে, শুধু সীমানায় মিশে যায়।
+async function renderItem(item, k) {
+  const D = item.n + item.tp / 2 + item.tn / 2;
+  const dSec = D / FPS;
+  let inputArgs;
+  let chain;
+  if (item.kind === "gap") {
+    inputArgs = ["-f", "lavfi", "-i", `color=c=${borderHex}:s=${cw}x${ch}:r=${FPS}:d=${dSec.toFixed(3)}`];
+    chain = "[0:v]format=yuv420p[vv]";
   } else {
-    // ক্লিপ ঠিক সিনের সময়ে আঁটাতে গতি বদলানো হয় (Shotstack পথের মতোই: speed = আসল দৈর্ঘ্য / সিনের দৈর্ঘ্য)
-    const orig = probeDuration(src);
-    const pre = orig > 0 ? `setpts=PTS/${clamp(orig / d, 0.1, 10).toFixed(4)},` : "";
-    const vf = `${pre}fps=${FPS},scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},setsar=1,tpad=stop_mode=clone:stop_duration=${d.toFixed(3)}`;
-    ff(["-i", src, "-vf", vf, "-t", d.toFixed(3), ...ENC, outp]);
+    const src = await resolveMedia(item.media, `m${k}`);
+    inputArgs = ["-i", src];
+    if (item.media.type === "photo") {
+      chain =
+        `[0:v]scale=${cw * 2}:${ch * 2}:force_original_aspect_ratio=increase,crop=${cw * 2}:${ch * 2},` +
+        `zoompan=z='1+0.15*on/${D}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${D}:s=${cw}x${ch}:fps=${FPS},setsar=1,format=yuv420p[vv]`;
+    } else {
+      // ক্লিপ ঠিক সময়ে আঁটাতে গতি বদলানো হয় (speed = আসল দৈর্ঘ্য / প্রয়োজনীয় দৈর্ঘ্য)
+      const orig = probeDuration(src);
+      const pre = orig > 0 ? `setpts=PTS/${clamp(orig / dSec, 0.1, 10).toFixed(4)},` : "";
+      chain =
+        `[0:v]${pre}fps=${FPS},scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},setsar=1,` +
+        `tpad=stop_mode=clone:stop_duration=${dSec.toFixed(3)},format=yuv420p[vv]`;
+    }
   }
-  return outp;
+  const outs = [];
+  if (item.tp > 0) outs.push({ name: "head", from: 0, to: item.tp });
+  outs.push({ name: "body", from: item.tp, to: D - item.tn });
+  if (item.tn > 0) outs.push({ name: "tail", from: D - item.tn, to: D });
+
+  let graph = chain + ";";
+  if (outs.length > 1) graph += `[vv]split=${outs.length}${outs.map((_, i) => `[s${i}]`).join("")};`;
+  const src0 = (i) => (outs.length > 1 ? `[s${i}]` : "[vv]");
+  graph += outs.map((o, i) => `${src0(i)}trim=start_frame=${o.from}:end_frame=${o.to},setpts=PTS-STARTPTS[o${i}]`).join(";");
+
+  const args = [...inputArgs, "-filter_complex", graph];
+  const files = {};
+  outs.forEach((o, i) => {
+    const f = path.join(work, `it${k}_${o.name}.mp4`);
+    files[o.name] = f;
+    args.push("-map", `[o${i}]`, ...ENC, f);
+  });
+  ff(args);
+  return files;
 }
 
-function buildGap(len, idx) {
-  const outp = path.join(work, `gap${idx}.mp4`);
-  const color = "0x" + String(job.borderColor || "#1A1A1A").replace("#", "");
-  ff(["-f", "lavfi", "-i", `color=c=${color}:s=${cw}x${ch}:r=${FPS}:d=${len.toFixed(3)}`, ...ENC, outp]);
+function buildTransition(k, tailFile, headFile, tf) {
+  const outp = path.join(work, `tr${k}.mp4`);
+  const name = transitionList[k % transitionList.length];
+  ff([
+    "-i", tailFile, "-i", headFile,
+    "-filter_complex", `[0:v][1:v]xfade=transition=${name}:duration=${(tf / FPS).toFixed(4)}:offset=0,format=yuv420p[v]`,
+    "-map", "[v]", "-frames:v", String(tf), ...ENC, outp,
+  ]);
   return outp;
 }
 
@@ -112,9 +179,16 @@ const assTime = (s) => {
   const sec = Math.floor((cs % 6000) / 100);
   return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}.${String(cs % 100).padStart(2, "0")}`;
 };
-const assColor = (hex) => {
+const bgr = (hex) => {
   const h = String(hex || "#ffffff").replace("#", "").padStart(6, "0");
-  return `&H00${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase();
+  return `${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase();
+};
+const graphemes = (text) => {
+  try {
+    return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].map((s) => s.segment);
+  } catch (_) {
+    return [...text];
+  }
 };
 
 async function buildCaptions() {
@@ -134,6 +208,7 @@ async function buildCaptions() {
     }
   }
   const bold = c.font && c.font.bold ? -1 : 0;
+  const color = bgr(c.color);
   const head = [
     "[Script Info]",
     "ScriptType: v4.00+",
@@ -144,46 +219,121 @@ async function buildCaptions() {
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: Cap,${family},${c.size},${assColor(c.color)},${assColor(c.color)},&H00000000,&H00000000,${bold},0,0,0,100,100,0,0,1,0,0,2,0,0,0,1`,
+    // SecondaryColour পুরো স্বচ্ছ — টাইপরাইটারে (\k) এখনো না-আসা অক্ষর অদৃশ্য থাকে
+    `Style: Cap,${family},${c.size},&H00${color},&HFF${color},&H00000000,&H00000000,${bold},0,0,0,100,100,0,0,1,0,0,2,0,0,0,1`,
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
   ];
-  const fade = c.anim === "none" ? "" : "\\fad(150,150)";
-  const pos = `\\an2\\pos(${Math.round(W / 2)},${Math.round(c.bottomY)})`;
+  const x = Math.round(W / 2);
+  const y = Math.round(c.bottomY);
+  const anim = c.anim || "typewriter";
+  const boxL = Math.round((W - cw) / 2);
+  const boxR = boxL + cw;
+  const boxT = Math.round(y - c.size * 3);
+  const boxB = y + Math.round(c.size);
+
   const events = c.lines.map((l) => {
     const text = String(l.text).replace(/[{}\\]/g, "").replace(/\r?\n/g, " ");
-    return `Dialogue: 0,${assTime(l.start)},${assTime(l.start + l.length)},Cap,,0,0,0,,{${pos}${fade}}${text}`;
+    let tags = `\\an2\\pos(${x},${y})`;
+    let body = text;
+    if (anim === "typewriter") {
+      const g = graphemes(text);
+      const typeDur = Math.max(0.3, Math.min(l.length - 0.15, text.length * 0.05));
+      const cs = Math.max(1, Math.round((typeDur * 100) / Math.max(1, g.length)));
+      body = g.map((ch1) => `{\\k${cs}}${ch1}`).join("");
+      tags += "\\fad(0,120)";
+    } else if (anim === "fade") {
+      tags += "\\fad(220,150)";
+    } else if (anim === "slideUp") {
+      tags = `\\an2\\move(${x},${y + 50},${x},${y},0,300)\\fad(150,150)`;
+    } else if (anim === "slideLeft") {
+      tags = `\\an2\\move(${x + Math.round(cw * 0.18)},${y},${x},${y},0,300)\\fad(150,150)`;
+    } else if (anim === "zoom") {
+      tags += "\\fscx60\\fscy60\\t(0,300,\\fscx100\\fscy100)\\fad(150,150)";
+    } else if (anim === "wipeLeft") {
+      tags += `\\clip(${boxL},${boxT},${boxL},${boxB})\\t(0,350,\\clip(${boxL},${boxT},${boxR},${boxB}))\\fad(0,120)`;
+    } // none: কোনো অ্যানিমেশন নেই
+    return `Dialogue: 0,${assTime(l.start)},${assTime(l.start + l.length)},Cap,,0,0,0,,{${tags}}${body}`;
   });
   fs.writeFileSync(path.join(work, "cap.ass"), head.concat(events).join("\n") + "\n", "utf8");
   return true;
 }
 
+function runWithProgress(args, totalSec, onPct) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffmpeg", ["-y", "-hide_banner", "-loglevel", "warning", "-progress", "pipe:1", "-nostats", ...args], {
+      cwd: work,
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let buf = "";
+    p.stdout.on("data", (d) => {
+      buf += d;
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        const m = /^out_time_us=(\d+)/.exec(line);
+        if (m) onPct(Math.min(1, Number(m[1]) / 1e6 / totalSec));
+      }
+    });
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg failed (exit ${code})`))));
+  });
+}
+
 async function main() {
   const t0 = Date.now();
   const segs = job.segments.slice().sort((a, b) => a.start - b.start);
-  console.log(`Job: ${segs.length} scenes, ${W}x${H}, content ${cw}x${ch}, total ${job.total}s`);
 
-  // ১) প্রতিটা দৃশ্য আলাদা রেন্ডার (মেমরি কম লাগে), ফাঁক থাকলে বর্ডার-রঙের ক্লিপ বসে
-  const parts = [];
-  let cursor = 0;
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i];
-    if (s.start - cursor > 0.05) parts.push(buildGap(s.start - cursor, i));
-    console.log(`Scene ${i + 1}/${segs.length}`);
-    parts.push(await buildScene(s, i));
-    cursor = s.start + s.duration;
+  // ১) আইটেম তালিকা — সময় ফ্রেমে গোল করা (ক্রমযোজিত), যাতে অডিওর সাথে সময় সরে না যায়
+  const items = [];
+  let cursorF = 0;
+  for (const s of segs) {
+    let sF = toFrames(s.start);
+    if (sF - cursorF < 3) sF = cursorF;
+    else items.push({ kind: "gap", n: sF - cursorF });
+    const eF = Math.max(sF + 1, toFrames(s.start + s.duration));
+    items.push({ kind: "scene", n: eF - sF, media: s.media });
+    cursorF = eF;
+  }
+  const M = items.length;
+  console.log(`Job: ${segs.length} scenes (${M} items), ${W}x${H}, content ${cw}x${ch}, total ${job.total}s`);
+
+  // ২) প্রতিটা সীমানার ট্রানজিশন-দৈর্ঘ্য (জোড় সংখ্যক ফ্রেম); ছোট দৃশ্যে হার্ড-কাট
+  const tf = [];
+  for (let k = 0; k < M - 1; k++) {
+    let t = Math.min(16, Math.floor(0.45 * Math.min(items[k].n, items[k + 1].n)));
+    t -= t % 2;
+    tf.push(t >= 4 ? t : 0);
+  }
+  items.forEach((it, k) => {
+    it.tp = k > 0 ? tf[k - 1] : 0;
+    it.tn = k < M - 1 ? tf[k] : 0;
+  });
+
+  // ৩) রেন্ডার
+  const pieces = [];
+  for (let k = 0; k < M; k++) {
+    report("scenes", k + 1, M, 4 + 62 * (k / M));
+    console.log(`Item ${k + 1}/${M}`);
+    pieces.push(await renderItem(items[k], k));
   }
 
-  // ২) জোড়া লাগানো
-  fs.writeFileSync(path.join(work, "list.txt"), parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n"));
+  report("transitions", 0, M, 68, true);
+  const seq = [];
+  for (let k = 0; k < M; k++) {
+    seq.push(pieces[k].body);
+    if (k < M - 1 && tf[k] > 0) seq.push(buildTransition(k, pieces[k].tail, pieces[k + 1].head, tf[k]));
+    report("transitions", k + 1, M, 68 + 10 * ((k + 1) / M));
+  }
+  fs.writeFileSync(path.join(work, "list.txt"), seq.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n"));
   const joined = path.join(work, "joined.mp4");
   ff(["-f", "concat", "-safe", "0", "-i", path.join(work, "list.txt"), "-c", "copy", joined]);
 
-  // ৩) বর্ডার + ক্যাপশন + অডিও
+  // ৪) বর্ডার + ক্যাপশন + অডিও
   const hasSubs = await buildCaptions();
   const vf = [];
-  if (cw !== W || ch !== H) vf.push(`pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=0x${String(job.borderColor || "#1A1A1A").replace("#", "")}`);
+  if (cw !== W || ch !== H) vf.push(`pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${borderHex}`);
   if (hasSubs) vf.push("subtitles=cap.ass:fontsdir=fonts");
 
   const a = job.audio || {};
@@ -204,7 +354,10 @@ async function main() {
   if (vf.length) args.push("-vf", vf.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
   else args.push("-c:v", "copy");
   args.push("-af", af.join(","), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
-  ff(args, { cwd: work });
+
+  report("final", 0, 0, 80, true);
+  await runWithProgress(args, total, (p) => report("final", 0, 0, 80 + 19 * p));
+  report("final", 0, 0, 100, true);
   console.log(`Done in ${Math.round((Date.now() - t0) / 1000)}s -> ${outFile}`);
 }
 
