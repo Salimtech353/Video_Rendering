@@ -282,6 +282,62 @@ function runWithProgress(args, totalSec, onPct) {
   });
 }
 
+// ---------- ব্যাকগ্রাউন্ড মিউজিক + ducking ----------
+// ভয়েসওভারের নীরব অংশ খুঁজে (silencedetect) একটা মসৃণ "ভলিউম-কার্ভ" বানানো হয়:
+// কথা চললে মিউজিক duck ভলিউমে নামে, থামলে স্বাভাবিক ভলিউমে ওঠে। কার্ভটা মিউজিকের সাথে গুণ করা হয় (amultiply)।
+function detectSilences(voicePath) {
+  const r = spawnSync("ffmpeg", ["-hide_banner", "-nostats", "-i", voicePath, "-af", "silencedetect=noise=-35dB:d=0.5", "-f", "null", "-"], { encoding: "utf8" });
+  const out = (r.stderr || "") + (r.stdout || "");
+  const sil = [];
+  let cur = null;
+  for (const line of out.split("\n")) {
+    let m = /silence_start:\s*(-?[\d.]+)/.exec(line);
+    if (m) cur = { s: Math.max(0, parseFloat(m[1])), e: Infinity };
+    m = /silence_end:\s*(-?[\d.]+)/.exec(line);
+    if (m && cur) {
+      cur.e = parseFloat(m[1]);
+      sil.push(cur);
+      cur = null;
+    }
+  }
+  if (cur) sil.push(cur); // শেষ পর্যন্ত নীরব
+  return sil;
+}
+
+function buildGainCurve(voicePath, total, normal, duck) {
+  const GR = 400; // কার্ভের স্যাম্পল রেট (Hz)
+  const n = Math.ceil(total * GR) + GR;
+  const duckAt = new Uint8Array(n); // 1 = এই মুহূর্তে মিউজিক নামবে
+  const sil = detectSilences(voicePath);
+  // কথার অংশ = নীরব অংশের পরিপূরক
+  let t = 0;
+  const speech = [];
+  for (const q of sil) {
+    if (q.s > t + 0.05) speech.push([t, q.s]);
+    t = Math.max(t, q.e);
+  }
+  if (t < total - 0.05) speech.push([t, total + 1]);
+  const lead = 0.12; // কথা শুরুর একটু আগেই মিউজিক নামতে শুরু করে
+  for (const [a, b] of speech) {
+    const i0 = Math.max(0, Math.floor((a - lead) * GR));
+    const i1 = Math.min(n, Math.ceil(b * GR));
+    for (let i = i0; i < i1; i++) duckAt[i] = 1;
+  }
+  const ratio = normal > 0 ? Math.min(1, duck / normal) : 1;
+  const out = new Float32Array(n);
+  let g = 1;
+  const aDown = 1 - Math.exp(-1 / (GR * 0.06)); // নামা: দ্রুত (~০.০৬ সে)
+  const aUp = 1 - Math.exp(-1 / (GR * 0.45)); // ওঠা: ধীর, স্বাভাবিক (~০.৪৫ সে)
+  for (let i = 0; i < n; i++) {
+    const tgt = duckAt[i] ? ratio : 1;
+    g += (tgt - g) * (tgt < g ? aDown : aUp);
+    out[i] = g;
+  }
+  const file = path.join(work, "gain.f32");
+  fs.writeFileSync(file, Buffer.from(out.buffer));
+  return { file, rate: GR, speechSecs: speech.reduce((s, [a, b]) => s + Math.min(b, total) - a, 0) };
+}
+
 async function main() {
   const t0 = Date.now();
   const segs = job.segments.slice().sort((a, b) => a.start - b.start);
@@ -346,10 +402,31 @@ async function main() {
     await download(a.url, audioPath);
   }
   const total = Number(job.total);
-  const af = [`volume=${a.volume || 1}`];
-  if (a.bg) af.push(`afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2`);
-
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
+
+  if (job.music && a.file && !a.bg) {
+    // ভয়েস + মিউজিক (ducking সহ) আগে আলাদা অডিও ফাইলে মেশানো হয়, তারপর ভিডিওর সাথে জোড়া লাগে
+    const musicPath = path.join(jobDir, path.basename(job.music.file));
+    const normal = clamp(Number(job.music.vol) || 0.4, 0.02, 1);
+    const duck = clamp(Number(job.music.duck) || 0, 0, normal);
+    const gain = buildGainCurve(audioPath, total, normal, duck);
+    console.log(`Music: normal ${normal}, duck ${duck}, speech ~${Math.round(gain.speechSecs)}s of ${Math.round(total)}s`);
+    const fmt = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
+    const fo = Math.max(0, total - 2).toFixed(2);
+    const fc =
+      `[0:a]${fmt}[voice];` +
+      `[1:a]${fmt},volume=${normal},atrim=0:${total.toFixed(3)},afade=t=in:d=0.6,afade=t=out:st=${fo}:d=2[mus0];` +
+      `[2:a]aresample=44100,pan=stereo|c0=c0|c1=c0,atrim=0:${total.toFixed(3)}[gain];` +
+      `[mus0][gain]amultiply[mus];` +
+      `[voice][mus]amix=inputs=2:normalize=0:duration=longest,alimiter=limit=0.95[aout]`;
+    const mixFile = path.join(work, "mix.wav");
+    ff(["-i", audioPath, "-stream_loop", "-1", "-i", musicPath, "-f", "f32le", "-ar", String(gain.rate), "-ac", "1", "-i", gain.file,
+        "-filter_complex", fc, "-map", "[aout]", "-t", total.toFixed(3), mixFile]);
+    audioPath = mixFile;
+  }
+
+  const af = [`volume=${a.file && job.music && !a.bg ? 1 : a.volume || 1}`];
+  if (a.bg) af.push(`afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2`);
   const args = ["-i", joined];
   if (a.bg) args.push("-stream_loop", "-1");
   args.push("-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-t", total.toFixed(3));
