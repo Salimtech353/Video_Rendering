@@ -234,21 +234,22 @@ async function buildCaptions() {
   const boxB = y + Math.round(c.size);
 
   const events = c.lines.map((l) => {
-    const text = String(l.text).replace(/[{}\\]/g, "").replace(/\r?\n/g, " ");
-    let tags = `\\an2\\pos(${x},${y})`;
-    let body = text;
+    const text = String(l.text).replace(/[{}\\]/g, "").replace(/\r/g, "");
+    const sz = l.size || c.size;
+    let tags = `\\an2\\pos(${x},${y})\\fs${sz}`;
+    let body = text.replace(/\n/g, "\\N");
     if (anim === "typewriter") {
       const g = graphemes(text);
       const typeDur = Math.max(0.3, Math.min(l.length - 0.15, text.length * 0.05));
       const cs = Math.max(1, Math.round((typeDur * 100) / Math.max(1, g.length)));
-      body = g.map((ch1) => `{\\k${cs}}${ch1}`).join("");
+      body = g.map((ch1) => (ch1 === "\n" ? "\\N" : `{\\k${cs}}${ch1}`)).join("");
       tags += "\\fad(0,120)";
     } else if (anim === "fade") {
       tags += "\\fad(220,150)";
     } else if (anim === "slideUp") {
-      tags = `\\an2\\move(${x},${y + 50},${x},${y},0,300)\\fad(150,150)`;
+      tags = `\\an2\\fs${sz}\\move(${x},${y + 50},${x},${y},0,300)\\fad(150,150)`;
     } else if (anim === "slideLeft") {
-      tags = `\\an2\\move(${x + Math.round(cw * 0.18)},${y},${x},${y},0,300)\\fad(150,150)`;
+      tags = `\\an2\\fs${sz}\\move(${x + Math.round(cw * 0.18)},${y},${x},${y},0,300)\\fad(150,150)`;
     } else if (anim === "zoom") {
       tags += "\\fscx60\\fscy60\\t(0,300,\\fscx100\\fscy100)\\fad(150,150)";
     } else if (anim === "wipeLeft") {
@@ -334,7 +335,8 @@ async function main() {
   const hasSubs = await buildCaptions();
   const vf = [];
   if (cw !== W || ch !== H) vf.push(`pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${borderHex}`);
-  if (hasSubs) vf.push("subtitles=cap.ass:fontsdir=fonts");
+  // গুরুত্বপূর্ণ: "subtitles" ফিল্টার সরল শেপিং ব্যবহার করে, তাই বাংলা যুক্তাক্ষর ভাঙে। "ass" + shaping=complex (HarfBuzz) দিলে ঠিক আসে।
+  if (hasSubs) vf.push("ass=cap.ass:fontsdir=fonts:shaping=complex");
 
   const a = job.audio || {};
   let audioPath;
