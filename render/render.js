@@ -54,6 +54,10 @@ function report(stage, i, n, pct, force = false) {
 }
 
 async function download(url, dest) {
+  if (url.startsWith("file://")) {
+    fs.copyFileSync(url.slice(7), dest); // স্থানীয় টেস্টের জন্য
+    return dest;
+  }
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -338,8 +342,49 @@ function buildGainCurve(voicePath, total, normal, duck) {
   return { file, rate: GR, speechSecs: speech.reduce((s, [a, b]) => s + Math.min(b, total) - a, 0) };
 }
 
+// ---------- ব্র্যান্ড অ্যাসেট: সাবস্ক্রাইব ওভারলে (গ্রিন স্ক্রিন) ও এন্ড স্ক্রিন ----------
+const UA = { "User-Agent": "Mozilla/5.0 (ReelsFactory renderer)" };
+async function assertAsset(label, url) {
+  if (url.startsWith("file://")) return;
+  const res = await fetch(url, { method: "HEAD", headers: UA, redirect: "follow" }).catch(() => null);
+  if (!res || !res.ok) throw new Error(`${label} ফাইল পাওয়া যায়নি (${res ? res.status : "network"}): ${url}`);
+}
+const hasAudioStream = (file) =>
+  capture("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file]).length > 0;
+
+// প্রথম ফ্রেমের চার কোণ থেকে গ্রিন-স্ক্রিনের আসল রং বের করা (সবুজ/নীল যা-ই হোক)
+function detectKeyColor(file) {
+  const dims = capture("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", file]).split("x").map(Number);
+  const [w, h] = dims;
+  const r = spawnSync("ffmpeg", ["-v", "error", "-i", file, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], { maxBuffer: 1 << 28 });
+  const buf = r.stdout;
+  if (!w || !h || !buf || buf.length < w * h * 3) return { hex: "00FF00", mode: "green" };
+  const pts = [[4, 4], [w - 5, 4], [4, h - 5], [w - 5, h - 5]];
+  const med = (arr) => arr.sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+  const ch3 = [0, 1, 2].map((c) => med(pts.map(([x, y]) => buf[(y * w + x) * 3 + c])));
+  const hex = ch3.map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
+  const [R, G, B] = ch3;
+  const mode = G > R + 30 && G > B + 30 ? "green" : B > R + 30 && B > G + 30 ? "blue" : "none";
+  return { hex, mode };
+}
+
+// কী-করা ফ্রেমগুলোর আসল দৃশ্যমান অংশের সীমানা (পুরো ক্যানভাস নয়) — যাতে ছোট করলে বাটনটাই ছোট হয়, ফাঁকা সবুজ অংশ নয়
+function detectBBox(file, keyFilter) {
+  const r = spawnSync(
+    "ffmpeg",
+    ["-hide_banner", "-nostats", "-i", file, "-vf", `${keyFilter},format=yuva420p,alphaextract,cropdetect=limit=24:round=2:reset=0`, "-an", "-f", "null", "-"],
+    { encoding: "utf8" }
+  );
+  const all = [...(r.stderr || "").matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
+  if (!all.length) return null;
+  const m = all[all.length - 1];
+  return { w: +m[1], h: +m[2], x: +m[3], y: +m[4] };
+}
+
 async function main() {
   const t0 = Date.now();
+  if (job.overlay) await assertAsset("ওভারলে", job.overlay.url);
+  if (job.endscreen) await assertAsset("এন্ড স্ক্রিন", job.endscreen.url);
   const segs = job.segments.slice().sort((a, b) => a.start - b.start);
 
   // ১) আইটেম তালিকা — সময় ফ্রেমে গোল করা (ক্রমযোজিত), যাতে অডিওর সাথে সময় সরে না যায়
@@ -425,17 +470,124 @@ async function main() {
     audioPath = mixFile;
   }
 
-  const af = [`volume=${a.file && job.music && !a.bg ? 1 : a.volume || 1}`];
-  if (a.bg) af.push(`afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2`);
-  const args = ["-i", joined];
-  if (a.bg) args.push("-stream_loop", "-1");
-  args.push("-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-t", total.toFixed(3));
-  if (vf.length) args.push("-vf", vf.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
-  else args.push("-c:v", "copy");
-  args.push("-af", af.join(","), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
+  const mixedVol = a.file && job.music && !a.bg ? 1 : a.volume || 1;
+  let args;
+  let progTotal = total;
+
+  if (job.overlay || job.endscreen) {
+    // ওভারলে (গ্রিন-স্ক্রিন কী) এবং/অথবা এন্ড স্ক্রিন সহ একটাই ফিল্টার-গ্রাফ
+    const fmt = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
+    const mainDur = probeDuration(joined) || total;
+    const inputs = ["-i", joined];
+    if (a.bg) inputs.push("-stream_loop", "-1");
+    inputs.push("-i", audioPath);
+    let idx = 2;
+    const fc = [];
+    let cur = "[0:v]";
+    let curChanged = false;
+    let ovAudio = null;
+
+    if (cw !== W || ch !== H) {
+      fc.push(`${cur}pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${borderHex}[b1]`);
+      cur = "[b1]";
+      curChanged = true;
+    }
+
+    if (job.overlay) {
+      const ovStart = Number(job.overlay.start) || 20;
+      const ovDur = Number(job.overlay.dur) || 9;
+      if (mainDur < ovStart + 1) {
+        console.warn(`Overlay skipped: video (${mainDur.toFixed(1)}s) is shorter than ${ovStart + 1}s`);
+      } else {
+        const ovPath = path.join(work, "overlay.mp4");
+        await download(job.overlay.url, ovPath);
+        const key = detectKeyColor(ovPath);
+        const keyF = `chromakey=color=0x${key.hex}:similarity=0.15:blend=0.1`;
+        const bb = detectBBox(ovPath, keyF);
+        const crop = bb ? `crop=${bb.w}:${bb.h}:${bb.x}:${bb.y},` : "";
+        const frac = Number(job.overlay.widthFrac) || (W >= H ? 0.24 : 0.42);
+        const ow = Math.max(2, Math.round((W * frac) / 2) * 2);
+        const despill = key.mode === "none" ? "" : `format=gbrap,despill=type=${key.mode},`;
+        // ওভারলে ক্যাপশনের ঠিক ওপরে, নিচের মাঝখানে বসে
+        const c = job.captions || {};
+        const footBottom = (H + ch) / 2;
+        const capZone = c.enabled ? Math.round((c.size || 40) * 2.8) : Math.round(H * 0.03);
+        const ovBottom = Math.round(footBottom - capZone - H * 0.02);
+        console.log(`Overlay: key 0x${key.hex} (${key.mode}), bbox ${bb ? `${bb.w}x${bb.h}@${bb.x},${bb.y}` : "full"}, width ${ow}px, at ${ovStart}s for ${ovDur}s`);
+        fc.push(`[${idx}:v]${keyF},${crop}${despill}scale=${ow}:-2,format=yuva420p,setpts=PTS+${ovStart}/TB[ov]`);
+        fc.push(`${cur}[ov]overlay=x=(W-w)/2:y=${ovBottom}-h:enable='between(t,${ovStart},${ovStart + ovDur})':eof_action=pass[b2]`);
+        cur = "[b2]";
+        curChanged = true;
+        if (hasAudioStream(ovPath)) ovAudio = `[${idx}:a]${fmt},adelay=${ovStart * 1000}|${ovStart * 1000}[oa]`;
+        inputs.push("-i", ovPath);
+        idx++;
+      }
+    }
+
+    if (hasSubs) {
+      fc.push(`${cur}ass=cap.ass:fontsdir=fonts:shaping=complex[b3]`);
+      cur = "[b3]";
+      curChanged = true;
+    }
+
+    // মূল অডিও (ভয়েস/মিক্স/মিউজিক) — মূল ভিডিওর দৈর্ঘ্যে ঠিক কাটা বা প্যাড করা, যাতে এন্ড স্ক্রিনের সময় না সরে
+    const md = mainDur.toFixed(3);
+    const fadeBg = a.bg ? `,afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2` : "";
+    fc.push(`[1:a]${fmt},volume=${mixedVol}${fadeBg}[ma]`);
+    let aLabel = "[ma]";
+    if (ovAudio) {
+      fc.push(ovAudio);
+      fc.push(`[ma][oa]amix=inputs=2:normalize=0:duration=first[mb]`);
+      aLabel = "[mb]";
+    }
+    fc.push(`${aLabel}apad=whole_dur=${md},atrim=0:${md}[maina]`);
+
+    let vOut = cur;
+    let aOut = "[maina]";
+    let needEncode = curChanged;
+
+    if (job.endscreen) {
+      const enPath = path.join(work, "endscreen.mp4");
+      await download(job.endscreen.url, enPath);
+      const enDur = probeDuration(enPath) || 10;
+      const ed = enDur.toFixed(3);
+      // এন্ড স্ক্রিন যেকোনো মাপে হোক, ফ্রেমে ঠিকভাবে বসে; ফাঁকা অংশে ঝাপসা ব্যাকগ্রাউন্ড
+      fc.push(
+        `[${idx}:v]split=2[e1][e2];` +
+          `[e1]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:5[eb];` +
+          `[e2]scale=${W}:${H}:force_original_aspect_ratio=decrease[ef];` +
+          `[eb][ef]overlay=(W-w)/2:(H-h)/2,fps=${FPS},setsar=1,format=yuv420p[endv]`
+      );
+      if (hasAudioStream(enPath)) fc.push(`[${idx}:a]${fmt},apad=whole_dur=${ed},atrim=0:${ed}[enda]`);
+      else fc.push(`anullsrc=r=44100:cl=stereo,atrim=0:${ed}[enda]`);
+      fc.push(`${vOut}[maina][endv][enda]concat=n=2:v=1:a=1[vcat][acat]`);
+      inputs.push("-i", enPath);
+      idx++;
+      vOut = "[vcat]";
+      aOut = "[acat]";
+      needEncode = true;
+      progTotal = mainDur + enDur;
+      console.log(`End screen: ${enDur.toFixed(1)}s appended`);
+    }
+
+    args = [...inputs, "-filter_complex", fc.join(";"), "-map", needEncode ? vOut : "0:v:0", "-map", aOut];
+    if (needEncode) args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
+    else args.push("-c:v", "copy");
+    if (!job.endscreen) args.push("-t", md);
+    args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
+  } else {
+    const af = [`volume=${mixedVol}`];
+    if (a.bg) af.push(`afade=t=out:st=${Math.max(0, total - 2).toFixed(2)}:d=2`);
+    args = ["-i", joined];
+    if (a.bg) args.push("-stream_loop", "-1");
+    args.push("-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-t", total.toFixed(3));
+    if (vf.length) args.push("-vf", vf.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
+    else args.push("-c:v", "copy");
+    args.push("-af", af.join(","), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
+  }
 
   report("final", 0, 0, 80, true);
-  await runWithProgress(args, total, (p) => report("final", 0, 0, 80 + 19 * p));
+  await runWithProgress(args, progTotal, (p) => report("final", 0, 0, 80 + 19 * p));
   report("final", 0, 0, 100, true);
   console.log(`Done in ${Math.round((Date.now() - t0) / 1000)}s -> ${outFile}`);
 }
