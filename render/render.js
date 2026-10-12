@@ -358,15 +358,27 @@ function detectKeyColor(file) {
   const [w, h] = dims;
   const r = spawnSync("ffmpeg", ["-v", "error", "-i", file, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], { maxBuffer: 1 << 28 });
   const buf = r.stdout;
+  
+  // যদি ডাইমেনশন বা বাফার ঠিক না থাকে, ডিফল্ট সবুজ রিটার্ন করবে
   if (!w || !h || !buf || buf.length < w * h * 3) return { hex: "00FF00", mode: "green" };
+  
   const pts = [[4, 4], [w - 5, 4], [4, h - 5], [w - 5, h - 5]];
   const med = (arr) => arr.sort((a, b) => a - b)[Math.floor(arr.length / 2)];
   const ch3 = [0, 1, 2].map((c) => med(pts.map(([x, y]) => buf[(y * w + x) * 3 + c])));
-  const hex = ch3.map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
+  
   const [R, G, B] = ch3;
   const mode = G > R + 30 && G > B + 30 ? "green" : B > R + 30 && B > G + 30 ? "blue" : "none";
+  
+  // সেফটি চেক: যদি ব্যাকগ্রাউন্ড নিশ্চিতভাবে সবুজ বা নীল না হয় (যেমন লাল বা অন্য রঙ ধরে ফেলে), 
+  // তবে জোর করে স্ট্যান্ডার্ড গ্রিন স্ক্রিন (00FF00) সেট করে দেওয়া হলো যাতে মূল ভিডিও কেটে না যায়।
+  if (mode === "none") {
+    return { hex: "00FF00", mode: "green" };
+  }
+
+  const hex = ch3.map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
   return { hex, mode };
 }
+
 
 // কী-করা ফ্রেমগুলোর আসল দৃশ্যমান অংশের সীমানা (পুরো ক্যানভাস নয়) — যাতে ছোট করলে বাটনটাই ছোট হয়, ফাঁকা সবুজ অংশ নয়
 function detectBBox(file, keyFilter) {
