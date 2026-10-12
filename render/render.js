@@ -505,7 +505,7 @@ async function main() {
       curChanged = true;
     }
 
-    if (job.overlay) {
+        if (job.overlay) {
       const ovStart = Number(job.overlay.start) || 20;
       const ovDur = Number(job.overlay.dur) || 9;
       if (mainDur < ovStart + 1) {
@@ -517,24 +517,28 @@ async function main() {
         const keyF = `chromakey=color=0x${key.hex}:similarity=0.15:blend=0.1`;
         const bb = detectBBox(ovPath, keyF);
         const crop = bb ? `crop=${bb.w}:${bb.h}:${bb.x}:${bb.y},` : "";
-        const frac = Number(job.overlay.widthFrac) || (W >= H ? 0.24 : 0.42);
+        
+        // ১. সাইজ ছোট করা: লোগোর চেয়ে একটু বড় রাখার জন্য ফ্র্যাকশন কমিয়ে 0.10 বা 0.12 করা হলো (প্রয়োজনে কম-বেশি করতে পারেন)
+        const frac = Number(job.overlay.widthFrac) || 0.15; 
         const ow = Math.max(2, Math.round((W * frac) / 2) * 2);
+        
         const despill = key.mode === "none" ? "" : `format=gbrap,despill=type=${key.mode},`;
-        // ওভারলে ক্যাপশনের ঠিক ওপরে, নিচের মাঝখানে বসে
-        const c = job.captions || {};
-        const footBottom = (H + ch) / 2;
-        const capZone = c.enabled ? Math.round((c.size || 40) * 2.8) : Math.round(H * 0.03);
-        const ovBottom = Math.round(footBottom - capZone - H * 0.02);
+        
         console.log(`Overlay: key 0x${key.hex} (${key.mode}), bbox ${bb ? `${bb.w}x${bb.h}@${bb.x},${bb.y}` : "full"}, width ${ow}px, at ${ovStart}s for ${ovDur}s`);
+        
         fc.push(`[${idx}:v]${keyF},${crop}${despill}scale=${ow}:-2,format=yuva420p,setpts=PTS+${ovStart}/TB[ov]`);
-        fc.push(`${cur}[ov]overlay=x=(W-w)/2:y=${ovBottom}-h:enable='between(t,${ovStart},${ovStart + ovDur})':eof_action=pass[b2]`);
+        
+        // ২. পজিশন পরিবর্তন: x=30 এবং y=30 দিয়ে এটিকে ভিডিওর ওপরের বাম কোণায় (Top-Left) সেট করা হলো
+        fc.push(`${cur}[ov]overlay=x=30:y=30:enable='between(t,${ovStart},${ovStart + ovDur})':eof_action=pass[b2]`);
+        
         cur = "[b2]";
         curChanged = true;
         if (hasAudioStream(ovPath)) ovAudio = `[${idx}:a]${fmt},adelay=${ovStart * 1000}|${ovStart * 1000}[oa]`;
         inputs.push("-i", ovPath);
         idx++;
       }
-    }
+        }
+    
 
     if (hasSubs) {
       fc.push(`${cur}ass=cap.ass:fontsdir=fonts:shaping=complex[b3]`);
