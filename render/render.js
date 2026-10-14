@@ -195,9 +195,75 @@ const graphemes = (text) => {
   }
 };
 
-async function buildCaptions() {
+// ---------- ক্যাপশনের সময় ভয়েসের আসল কথার সাথে মেলানো ----------
+// সমস্যা: Gemini-র টাইমস্ট্যাম্প আনুমানিক এবং এক সিনের শেষ = পরের সিনের শুরু ধরা হয়,
+//         তাই দুই সিনের মাঝের নীরব বিরতিতেও ক্যাপশন দেখাত।
+// সমাধান: ভয়েস ফাইলের আসল শব্দ থেকে "কথা চলার অংশ" (speech blocks) বের করে
+//         প্রতিটা ক্যাপশনকে শুধু তার কথা চলার সময়টুকুতে ছেঁটে দেওয়া হয়। ভিডিওর দৃশ্য আগের মতোই পুরো সময় চলে।
+
+// নীরব অংশের তালিকা থেকে উল্টো করে "কথার অংশ" [শুরু, শেষ] বের করা
+function speechBlocksFrom(silences, total) {
+  let t = 0;
+  const blocks = [];
+  for (const q of silences) {
+    if (q.s > t + 0.02) blocks.push([t, q.s]);
+    t = Math.max(t, q.e);
+  }
+  if (t < total - 0.02) blocks.push([t, total]);
+  return blocks;
+}
+
+// প্রতিটা ক্যাপশন লাইনকে (লেখা + শুরু + দৈর্ঘ্য) তার সময়-জানালার ভেতরের কথার অংশে ছেঁটে ফেরত দেয়
+function trimCaptionsToSpeech(lines, blocks) {
+  const LEAD = 0.1; // কথা শুরুর একটু আগে ক্যাপশন আসে
+  const TAIL = 0.2; // কথা থামার একটু পরে ক্যাপশন যায়
+  const PULL = 0.3; // Gemini-র সময় সামান্য দেরিতে হলে এতটুকু পর্যন্ত আগে/পরে টেনে ঠিক করা হয়
+  const MINLEN = 0.15; // এর চেয়ে ছোট হলে ক্যাপশন বাদ
+  const out = [];
+  lines.forEach((l, i) => {
+    const ws = l.start;
+    const we = l.start + l.length;
+    // এই ক্যাপশনের সময়ের সাথে যেসব কথার অংশ মেলে
+    const hit = blocks.filter(([bs, be]) => be > ws && bs < we);
+    if (!hit.length) {
+      console.log(`Caption ${i + 1}: ${ws.toFixed(2)}-${we.toFixed(2)}s → বাদ (এই সময়ে কোনো কথা নেই)`);
+      return;
+    }
+    const first = hit[0];
+    const last = hit[hit.length - 1];
+    // শুরু: প্রথম কথা শুরুর মুহূর্ত (জানালার আগে যাবে না)। কথা জানালার ঠিক আগেই (≤PULL) শুরু হলে সামান্য আগে টানা হয়
+    let s = Math.max(ws, first[0] - LEAD);
+    if (first[0] < ws && ws - first[0] <= PULL) s = Math.max(ws - PULL, first[0] - LEAD);
+    // শেষ: শেষ কথা থামার মুহূর্ত (জানালার পরে যাবে না)। কথা জানালার ঠিক পরেই (≤PULL) থামলে সামান্য পরে টানা হয়
+    let e = Math.min(we, last[1] + TAIL);
+    if (last[1] > we && last[1] - we <= PULL) e = Math.min(last[1] + TAIL, we + PULL);
+    // আগের ক্যাপশনের সাথে যেন ওভারল্যাপ না হয়
+    if (out.length) {
+      const p = out[out.length - 1];
+      if (s < p.start + p.length) s = p.start + p.length;
+    }
+    if (e - s < MINLEN) {
+      console.log(`Caption ${i + 1}: ${ws.toFixed(2)}-${we.toFixed(2)}s → বাদ (কথার অংশ খুব ছোট)`);
+      return;
+    }
+    console.log(`Caption ${i + 1}: ${ws.toFixed(2)}-${we.toFixed(2)}s → ${s.toFixed(2)}-${e.toFixed(2)}s`);
+    out.push({ ...l, start: Number(s.toFixed(3)), length: Number((e - s).toFixed(3)) });
+  });
+  return out;
+}
+
+async function buildCaptions(voicePath) {
   const c = job.captions;
   if (!c || !c.enabled || !c.lines || !c.lines.length) return false;
+  // ভয়েসওভার থাকলে ক্যাপশনের সময় কথার আসল অংশে ছাঁটা হয় (AI ভয়েসে নয়েজ নেই, তাই কড়া সীমা: -45dB, ন্যূনতম ০.৩ সে বিরতি)
+  let capLines = c.lines;
+  if (voicePath) {
+    const total0 = Number(job.total);
+    const blocks = speechBlocksFrom(detectSilences(voicePath, "-45dB", 0.3), total0);
+    console.log(`Caption timing: ${blocks.length} speech blocks found in voiceover`);
+    capLines = trimCaptionsToSpeech(c.lines, blocks);
+    if (!capLines.length) return false;
+  }
   let family = (c.font && c.font.name) || "Noto Sans Bengali";
   const fontsDir = path.join(work, "fonts");
   fs.mkdirSync(fontsDir, { recursive: true });
@@ -237,7 +303,7 @@ async function buildCaptions() {
   const boxT = Math.round(y - c.size * 3);
   const boxB = y + Math.round(c.size);
 
-  const events = c.lines.map((l) => {
+  const events = capLines.map((l) => {
     const text = String(l.text).replace(/[{}\\]/g, "").replace(/\r/g, "");
     const sz = l.size || c.size;
     let tags = `\\an2\\pos(${x},${y})\\fs${sz}`;
@@ -289,8 +355,10 @@ function runWithProgress(args, totalSec, onPct) {
 // ---------- ব্যাকগ্রাউন্ড মিউজিক + ducking ----------
 // ভয়েসওভারের নীরব অংশ খুঁজে (silencedetect) একটা মসৃণ "ভলিউম-কার্ভ" বানানো হয়:
 // কথা চললে মিউজিক duck ভলিউমে নামে, থামলে স্বাভাবিক ভলিউমে ওঠে। কার্ভটা মিউজিকের সাথে গুণ করা হয় (amultiply)।
-function detectSilences(voicePath) {
-  const r = spawnSync("ffmpeg", ["-hide_banner", "-nostats", "-i", voicePath, "-af", "silencedetect=noise=-35dB:d=0.5", "-f", "null", "-"], { encoding: "utf8" });
+// noiseDb = এর নিচের শব্দকে "নীরব" ধরা হয়; minDur = কমপক্ষে এত সেকেন্ড টানা নীরব থাকলে তবেই বিরতি।
+// ducking এর জন্য ডিফল্ট (-35dB, ০.৫ সে)। ক্যাপশনের জন্য কড়া মান দেওয়া হয় (নিচে দেখুন)।
+function detectSilences(voicePath, noiseDb = "-35dB", minDur = 0.5) {
+  const r = spawnSync("ffmpeg", ["-hide_banner", "-nostats", "-i", voicePath, "-af", `silencedetect=noise=${noiseDb}:d=${minDur}`, "-f", "null", "-"], { encoding: "utf8" });
   const out = (r.stderr || "") + (r.stdout || "");
   const sil = [];
   let cur = null;
@@ -433,7 +501,9 @@ async function main() {
   ff(["-f", "concat", "-safe", "0", "-i", path.join(work, "list.txt"), "-c", "copy", joined]);
 
   // ৪) বর্ডার + ক্যাপশন + অডিও
-  const hasSubs = await buildCaptions();
+  // ভয়েসওভার ফাইল (শুধু আসল ভয়েস থাকলে; ব্যাকগ্রাউন্ড-মিউজিক-ই একমাত্র অডিও হলে নয়)
+  const voicePath = job.audio && job.audio.file && !job.audio.bg ? path.join(jobDir, path.basename(job.audio.file)) : null;
+  const hasSubs = await buildCaptions(voicePath);
   const vf = [];
   if (cw !== W || ch !== H) vf.push(`pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${borderHex}`);
   // গুরুত্বপূর্ণ: "subtitles" ফিল্টার সরল শেপিং ব্যবহার করে, তাই বাংলা যুক্তাক্ষর ভাঙে। "ass" + shaping=complex (HarfBuzz) দিলে ঠিক আসে।
@@ -503,19 +573,13 @@ async function main() {
         await download(job.overlay.url, ovPath);
         const key = detectKeyColor(ovPath);
         const keyF = `chromakey=color=0x${key.hex}:similarity=0.15:blend=0.1`;
-        const bb = detectBBox(ovPath, keyF);
-        const crop = bb ? `crop=${bb.w}:${bb.h}:${bb.x}:${bb.y},` : "";
-        const frac = Number(job.overlay.widthFrac) || (W >= H ? 0.24 : 0.42);
+        // CapCut-এ যেমন: পুরো ওভারলে ক্যানভাস ওপরের বাঁ কোণে, ল্যান্ডস্কেপে ভিডিও-প্রস্থের ~২৩.৩%
+        const frac = Number(job.overlay.widthFrac) || (W >= H ? 0.2333 : 0.4);
         const ow = Math.max(2, Math.round((W * frac) / 2) * 2);
         const despill = key.mode === "none" ? "" : `format=gbrap,despill=type=${key.mode},`;
-        // ওভারলে ক্যাপশনের ঠিক ওপরে, নিচের মাঝখানে বসে
-        const c = job.captions || {};
-        const footBottom = (H + ch) / 2;
-        const capZone = c.enabled ? Math.round((c.size || 40) * 2.8) : Math.round(H * 0.03);
-        const ovBottom = Math.round(footBottom - capZone - H * 0.02);
-        console.log(`Overlay: key 0x${key.hex} (${key.mode}), bbox ${bb ? `${bb.w}x${bb.h}@${bb.x},${bb.y}` : "full"}, width ${ow}px, at ${ovStart}s for ${ovDur}s`);
-        fc.push(`[${idx}:v]${keyF},${crop}${despill}scale=${ow}:-2,format=yuva420p,setpts=PTS+${ovStart}/TB[ov]`);
-        fc.push(`${cur}[ov]overlay=x=(W-w)/2:y=${ovBottom}-h:enable='between(t,${ovStart},${ovStart + ovDur})':eof_action=pass[b2]`);
+        console.log(`Overlay: key 0x${key.hex} (${key.mode}), width ${ow}px, top-left, at ${ovStart}s for ${ovDur}s`);
+        fc.push(`[${idx}:v]${keyF},${despill}scale=${ow}:-2,format=yuva420p,setpts=PTS+${ovStart}/TB[ov]`);
+        fc.push(`${cur}[ov]overlay=x=0:y=0:enable='between(t,${ovStart},${ovStart + ovDur})':eof_action=pass[b2]`);
         cur = "[b2]";
         curChanged = true;
         if (hasAudioStream(ovPath)) ovAudio = `[${idx}:a]${fmt},adelay=${ovStart * 1000}|${ovStart * 1000}[oa]`;
@@ -560,7 +624,10 @@ async function main() {
       );
       if (hasAudioStream(enPath)) fc.push(`[${idx}:a]${fmt},apad=whole_dur=${ed},atrim=0:${ed}[enda]`);
       else fc.push(`anullsrc=r=44100:cl=stereo,atrim=0:${ed}[enda]`);
-      fc.push(`${vOut}[maina][endv][enda]concat=n=2:v=1:a=1[vcat][acat]`);
+      // মূল ভিডিওর শেষ ১.৫ সেকেন্ড কালো হয়ে মিলিয়ে যায়, তারপর এন্ড স্ক্রিন
+      const fd = Math.min(1.5, Math.max(0.2, mainDur - 0.5));
+      fc.push(`${vOut}fade=t=out:st=${(mainDur - fd).toFixed(3)}:d=${fd.toFixed(3)}:color=black[mainfade]`);
+      fc.push(`[mainfade][maina][endv][enda]concat=n=2:v=1:a=1[vcat][acat]`);
       inputs.push("-i", enPath);
       idx++;
       vOut = "[vcat]";
