@@ -119,7 +119,7 @@ const transitionList = (job.transitions && job.transitions.length ? job.transiti
 
 // ---------- একটা আইটেম (দৃশ্য/ফাঁক) রেন্ডার: head | body | tail টুকরো ----------
 // head/tail হলো ট্রানজিশনে মেশার অংশ (tp/tn ফ্রেম); এতে দৃশ্যের সময় ঠিক থাকে, শুধু সীমানায় মিশে যায়।
-Async function renderItem(item, k) {
+async function renderItem(item, k) {
   Const D = item.n + item.tp / 2 + item.tn / 2;
   Const dSec = D / FPS;
   Let inputArgs;
@@ -173,7 +173,7 @@ Async function renderItem(item, k) {
     Files[o.name] = f;
     Args.push("-map", `[o${i}]`, ...ENC, f);
   });
-  ff(args);
+  Ff(args);
   Return files;
 }
 
