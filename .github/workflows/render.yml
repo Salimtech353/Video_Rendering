@@ -49,7 +49,7 @@ jobs:
             git push -q || (git pull --rebase -q && git push -q) || true
           fi
           # সর্বশেষ ৩০টা রিলিজ রাখা হয়, পুরনোগুলো মুছে যায়
-          gh release list --limit 200 --json tagName --jq '.[30:][].tagName' | while read -r tag; do
+          gh release list --limit 200 --json tagName --jq '.[20:][].tagName' | while read -r tag; do
             gh release delete "$tag" --cleanup-tag -y || true
           done
           
