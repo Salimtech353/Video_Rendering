@@ -119,50 +119,64 @@ const transitionList = (job.transitions && job.transitions.length ? job.transiti
 
 // ---------- একটা আইটেম (দৃশ্য/ফাঁক) রেন্ডার: head | body | tail টুকরো ----------
 // head/tail হলো ট্রানজিশনে মেশার অংশ (tp/tn ফ্রেম); এতে দৃশ্যের সময় ঠিক থাকে, শুধু সীমানায় মিশে যায়।
-async function renderItem(item, k) {
-  const D = item.n + item.tp / 2 + item.tn / 2;
-  const dSec = D / FPS;
-  let inputArgs;
-  let chain;
-  if (item.kind === "gap") {
-    inputArgs = ["-f", "lavfi", "-i", `color=c=${borderHex}:s=${cw}x${ch}:r=${FPS}:d=${dSec.toFixed(3)}`];
-    chain = "[0:v]format=yuv420p[vv]";
+Async function renderItem(item, k) {
+  Const D = item.n + item.tp / 2 + item.tn / 2;
+  Const dSec = D / FPS;
+  Let inputArgs;
+  Let chain;
+  If (item.kind === "gap") {
+    InputArgs = ["-f", "lavfi", "-i", `color=c=${borderHex}:s=${cw}x${ch}:r=${FPS}:d=${dSec.toFixed(3)}`];
+    Chain = "[0:v]format=yuv420p[vv]";
   } else {
-    const src = await resolveMedia(item.media, `m${k}`);
-    inputArgs = ["-i", src];
-    if (item.media.type === "photo") {
-      chain =
+    Const src = await resolveMedia(item.media, `m${k}`);
+    InputArgs = ["-i", src];
+    If (item.media.type === "photo") {
+      Chain =
         `[0:v]scale=${cw * 2}:${ch * 2}:force_original_aspect_ratio=increase,crop=${cw * 2}:${ch * 2},` +
         `zoompan=z='1+0.15*on/${D}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${D}:s=${cw}x${ch}:fps=${FPS},setsar=1,format=yuv420p[vv]`;
     } else {
-      // ক্লিপ ঠিক সময়ে আঁটাতে গতি বদলানো হয় (speed = আসল দৈর্ঘ্য / প্রয়োজনীয় দৈর্ঘ্য)
-      const orig = probeDuration(src);
-      const pre = orig > 0 ? `setpts=PTS/${clamp(orig / dSec, 0.1, 10).toFixed(4)},` : "";
-      chain =
+      // ভিডিওর আসল দৈর্ঘ্য বের করা
+      Const origSec = probeDuration(src); // ধরে নিচ্ছি এটি সেকেন্ডে আসল দৈর্ঘ্য দেয়
+      
+      Let pre = "";
+      If (origSec > 0) {
+        If (origSec < dSec) {
+          // ভিডিও ছোট হলে স্লো-মোশন করে টাইমস্ট্যাম্পের সমান করা (স্পিড বাড়ানো হবে না)
+          Const speedFactor = origSec / dSec; // এটি ১ এর কম হবে
+          Const ptsMultiplier = (1 / speedFactor).toFixed(4);
+          Pre = `setpts=PTS*${ptsMultiplier},`;
+        } else {
+          // ভিডিও বড় হলে শুধু ট্রিম হবে, কোনো ফাস্ট মোশন হবে না
+          Pre = ""; 
+        }
+      }
+
+      Chain =
         `[0:v]${pre}fps=${FPS},scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},setsar=1,` +
-        `tpad=stop_mode=clone:stop_duration=${dSec.toFixed(3)},format=yuv420p[vv]`;
+        `format=yuv420p[vv]`;
     }
   }
-  const outs = [];
-  if (item.tp > 0) outs.push({ name: "head", from: 0, to: item.tp });
-  outs.push({ name: "body", from: item.tp, to: D - item.tn });
-  if (item.tn > 0) outs.push({ name: "tail", from: D - item.tn, to: D });
+  Const outs = [];
+  If (item.tp > 0) outs.push({ name: "head", from: 0, to: item.tp });
+  Outs.push({ name: "body", from: item.tp, to: D - item.tn });
+  If (item.tn > 0) outs.push({ name: "tail", from: D - item.tn, to: D });
 
-  let graph = chain + ";";
-  if (outs.length > 1) graph += `[vv]split=${outs.length}${outs.map((_, i) => `[s${i}]`).join("")};`;
-  const src0 = (i) => (outs.length > 1 ? `[s${i}]` : "[vv]");
-  graph += outs.map((o, i) => `${src0(i)}trim=start_frame=${o.from}:end_frame=${o.to},setpts=PTS-STARTPTS[o${i}]`).join(";");
+  Let graph = chain + ";";
+  If (outs.length > 1) graph += `[vv]split=${outs.length}${outs.map((_, i) => `[s${i}]`).join("")};`;
+  Const src0 = (i) => (outs.length > 1 ? `[s${i}]` : "[vv]");
+  Graph += outs.map((o, i) => `${src0(i)}trim=start_frame=${o.from}:end_frame=${o.to},setpts=PTS-STARTPTS[o${i}]`).join(";");
 
-  const args = [...inputArgs, "-filter_complex", graph];
-  const files = {};
-  outs.forEach((o, i) => {
-    const f = path.join(work, `it${k}_${o.name}.mp4`);
-    files[o.name] = f;
-    args.push("-map", `[o${i}]`, ...ENC, f);
+  Const args = [...inputArgs, "-filter_complex", graph];
+  Const files = {};
+  Outs.forEach((o, i) => {
+    Const f = path.join(work, `it${k}_${o.name}.mp4`);
+    Files[o.name] = f;
+    Args.push("-map", `[o${i}]`, ...ENC, f);
   });
   ff(args);
-  return files;
+  Return files;
 }
+
 
 function buildTransition(k, tailFile, headFile, tf) {
   const outp = path.join(work, `tr${k}.mp4`);
