@@ -100,7 +100,21 @@ function probeDuration(file) {
   return Number.isFinite(v) ? v : 0;
 }
 
-const ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-r", String(FPS), "-an"];
+// মান বনাম গিটহাব-নিরাপত্তা:
+// ১) মধ্যবর্তী টুকরো (দৃশ্য/ট্রানজিশন) প্রায় লসলেস (crf 16) — বারবার কমপ্রেসে মান যেন না হারায়। এগুলো অস্থায়ী, জোড়া লাগার পর মুছে ফেলা হয়।
+//    সব টুকরোর সেটিং একই রাখতে হবে, নইলে `concat -c copy` ভেঙে যায়।
+// ২) চূড়ান্ত ভিডিও একবারই ভালো মানে এনকোড হয় (preset medium, crf 18) এবং বিটরেটে সীমা থাকে,
+//    যাতে ফাইল GitHub Release-এর ২GB সীমার মধ্যে থাকে। ১০৮০p-তে সীমা ১০ Mbps (ইউটিউবের সুপারিশ ৮ Mbps)।
+// কোনোটা বদলাতে চাইলে workflow-র env-এ INTER_CRF / FINAL_PRESET / FINAL_CRF / FINAL_MAXRATE_MBPS দিন (কোড বদলাতে হবে না)।
+const INTER_CRF = process.env.INTER_CRF || "16";
+const FINAL_PRESET = process.env.FINAL_PRESET || "medium";
+const FINAL_CRF = process.env.FINAL_CRF || "18";
+const FINAL_MAXRATE = Number(process.env.FINAL_MAXRATE_MBPS) || Math.max(3, Math.round((10 * (Number(W) * Number(H))) / (1920 * 1080)));
+const ENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", INTER_CRF, "-pix_fmt", "yuv420p", "-r", String(FPS), "-an"];
+const FINAL_VENC = [
+  "-c:v", "libx264", "-preset", FINAL_PRESET, "-crf", FINAL_CRF, "-profile:v", "high",
+  "-maxrate", `${FINAL_MAXRATE}M`, "-bufsize", `${FINAL_MAXRATE * 2}M`, "-pix_fmt", "yuv420p",
+];
 const borderHex = "0x" + String(job.borderColor || "#1A1A1A").replace("#", "");
 
 // অ্যাপের ট্রানজিশন নাম -> FFmpeg xfade নাম
@@ -133,7 +147,7 @@ async function renderItem(item, k) {
     inputArgs = ["-i", src];
     if (item.media.type === "photo") {
       chain =
-        `[0:v]scale=${cw * 2}:${ch * 2}:force_original_aspect_ratio=increase,crop=${cw * 2}:${ch * 2},` +
+        `[0:v]scale=${cw * 2}:${ch * 2}:force_original_aspect_ratio=increase:flags=lanczos,crop=${cw * 2}:${ch * 2},` +
         `zoompan=z='1+0.15*on/${D}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${D}:s=${cw}x${ch}:fps=${FPS},setsar=1,format=yuv420p[vv]`;
     } else {
       const origSec = probeDuration(src);
@@ -149,7 +163,7 @@ async function renderItem(item, k) {
       }
 
       chain =
-        `[0:v]${pre}fps=${FPS},scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},setsar=1,` +
+        `[0:v]${pre}fps=${FPS},scale=${cw}:${ch}:force_original_aspect_ratio=increase:flags=lanczos,crop=${cw}:${ch},setsar=1,` +
         `format=yuv420p[vv]`;
     }
   }
@@ -515,6 +529,12 @@ async function main() {
   fs.writeFileSync(path.join(work, "list.txt"), seq.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n"));
   const joined = path.join(work, "joined.mp4");
   ff(["-f", "concat", "-safe", "0", "-i", path.join(work, "list.txt"), "-c", "copy", joined]);
+  // রানারের ডিস্ক বাঁচাতে: জোড়া লাগানো শেষ, মধ্যবর্তী টুকরোগুলো আর লাগবে না
+  for (const f of [...seq, ...pieces.flatMap((x) => Object.values(x))]) {
+    try {
+      fs.unlinkSync(f);
+    } catch (_) {}
+  }
 
   // ৪) বর্ডার + ক্যাপশন + অডিও
   // ভয়েসওভার ফাইল (শুধু আসল ভয়েস থাকলে; ব্যাকগ্রাউন্ড-মিউজিক-ই একমাত্র অডিও হলে নয়)
@@ -622,9 +642,14 @@ async function main() {
     }
     fc.push(`${aLabel}apad=whole_dur=${md},atrim=0:${md}[maina]`);
 
+    // চূড়ান্ত ভিডিও সবসময় ভালো মানে একবার এনকোড হয় (কপি নয়); কোনো ভিডিও-ফিল্টার না থাকলে একটা খালি ফিল্টার বসে, যাতে লেবেল পাওয়া যায়
+    if (!curChanged) {
+      fc.push(`${cur}null[b0]`);
+      cur = "[b0]";
+    }
     let vOut = cur;
     let aOut = "[maina]";
-    let needEncode = curChanged;
+    let needEncode = true;
 
     if (job.endscreen) {
       const enPath = path.join(work, "endscreen.mp4");
@@ -634,8 +659,8 @@ async function main() {
       // এন্ড স্ক্রিন যেকোনো মাপে হোক, ফ্রেমে ঠিকভাবে বসে; ফাঁকা অংশে ঝাপসা ব্যাকগ্রাউন্ড
       fc.push(
         `[${idx}:v]split=2[e1][e2];` +
-          `[e1]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=30:5[eb];` +
-          `[e2]scale=${W}:${H}:force_original_aspect_ratio=decrease[ef];` +
+          `[e1]scale=${W}:${H}:force_original_aspect_ratio=increase:flags=lanczos,crop=${W}:${H},boxblur=30:5[eb];` +
+          `[e2]scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=lanczos[ef];` +
           `[eb][ef]overlay=(W-w)/2:(H-h)/2,fps=${FPS},setsar=1,format=yuv420p[endv]`
       );
       if (hasAudioStream(enPath)) fc.push(`[${idx}:a]${fmt},apad=whole_dur=${ed},atrim=0:${ed}[enda]`);
@@ -654,8 +679,7 @@ async function main() {
     }
 
     args = [...inputs, "-filter_complex", fc.join(";"), "-map", needEncode ? vOut : "0:v:0", "-map", aOut];
-    if (needEncode) args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
-    else args.push("-c:v", "copy");
+    args.push(...FINAL_VENC);
     if (!job.endscreen) args.push("-t", md);
     args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
   } else {
@@ -664,8 +688,8 @@ async function main() {
     args = ["-i", joined];
     if (a.bg) args.push("-stream_loop", "-1");
     args.push("-i", audioPath, "-map", "0:v:0", "-map", "1:a:0", "-t", total.toFixed(3));
-    if (vf.length) args.push("-vf", vf.join(","), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p");
-    else args.push("-c:v", "copy");
+    if (vf.length) args.push("-vf", vf.join(","));
+    args.push(...FINAL_VENC);
     args.push("-af", af.join(","), "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", outFile);
   }
 
